@@ -1,6 +1,7 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import re
+import logging
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
@@ -263,6 +264,7 @@ class TokenizePrompt(DataTransformFn):
             prompt = prompt.item()
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        # logging.info(f"Tokens: {tokens}")
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 

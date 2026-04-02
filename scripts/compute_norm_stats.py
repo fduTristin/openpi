@@ -95,7 +95,7 @@ def main(config_name: str, max_frames: int | None = None):
         metadata = BehaviorLerobotDatasetMetadata(
             repo_id=data_config.repo_id,
             root=data_config.behavior_dataset_root,
-            tasks=["turning_on_radio"],
+            tasks=["picking_up_trash"],
             modalities=[], 
             cameras=[]
         )

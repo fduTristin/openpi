@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 import socket
+import os
 
 import tyro
 
@@ -12,6 +13,7 @@ from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
 from openpi.shared.eval_b1k_wrapper import B1KPolicyWrapper
 from openpi.training import config as _config
+from datetime import datetime
 
 
 class EnvMode(enum.Enum):
@@ -50,12 +52,12 @@ class Args:
     default_prompt: str | None = None
 
     # Dataset root, used to retrieve the prompt of the task if taskname is not None.
-    dataset_root: str | None = "/scr/behavior/2025-challenge-demos"
+    dataset_root: str | None = "/home/xhz/Datasets/behavior/2025-challenge-demos"
     # If provided, will be used to retrieve the prompt of the task, otherwise use turning_on_radio as default.
     task_name: str | None = None
 
     # Port to serve the policy on.
-    port: int = 8000
+    port: int = 8081
     # Record the policy's behavior for debugging.
     record: bool = False
 
@@ -89,7 +91,7 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
-    policy = B1KPolicyWrapper(policy, text_prompt=prompt)
+    policy = B1KPolicyWrapper(policy, text_prompt=prompt, control_mode="receeding_horizon", action_horizon=25)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
@@ -105,5 +107,12 @@ def main(args: Args) -> None:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, force=True)
+    time_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    log_path = f"/home/xhz/logging/serve_b1k/"
+    os.makedirs(log_path, exist_ok=True)
+     
+    logging.basicConfig(level=logging.INFO,
+                        filename=log_path + f"{time_str}.log", 
+                        format="%(asctime)s %(levelname)s %(message)s",
+                        force=True)
     main(tyro.cli(Args))

@@ -134,7 +134,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
-        tasks=["turning_on_radio"],
+        tasks=["picking_up_trash"],  
         modalities=["rgb"],
         local_only=True,
         delta_timestamps={

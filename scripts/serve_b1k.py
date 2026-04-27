@@ -108,7 +108,7 @@ def main(args: Args) -> None:
 
 if __name__ == "__main__":
     time_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    log_path = f"/home/xhz/logging/serve_b1k/"
+    log_path = f"logs/serve_b1k/"
     os.makedirs(log_path, exist_ok=True)
      
     logging.basicConfig(level=logging.INFO,

@@ -142,6 +142,16 @@ class ModelTransformFactory(GroupFactory):
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
+                    high_level_inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizeHighLowPrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                            use_state_input=False
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
                 )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (

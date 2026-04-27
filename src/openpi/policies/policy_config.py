@@ -81,6 +81,13 @@ def create_trained_policy(
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
+        high_level_transforms=[
+            *repack_transforms.inputs,
+            transforms.InjectDefaultPrompt(default_prompt),
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.high_level_inputs,
+        ],
         output_transforms=[
             *data_config.model_transforms.outputs,
             transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),

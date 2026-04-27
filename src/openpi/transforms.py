@@ -1,6 +1,7 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import re
+import logging
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
@@ -42,6 +43,9 @@ class Group:
 
     # Transforms that are applied to the model input data.
     inputs: Sequence[DataTransformFn] = ()
+
+    # Transforms that are applied to the model high-level input data.
+    high_level_inputs: Sequence[DataTransformFn] = ()
 
     # Transforms that are applied to the model output data.
     outputs: Sequence[DataTransformFn] = ()
@@ -263,7 +267,53 @@ class TokenizePrompt(DataTransformFn):
             prompt = prompt.item()
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        # logging.info(f"Tokens: {tokens}")
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeHighLowPrompt(DataTransformFn):
+    """Tokenize hierarchical task prompts for stage-1 generation.
+
+    This transform keeps the same input/output structure convention as `TokenizePrompt`,
+    but additionally consumes a `subtask` field and returns autoregressive/loss masks.
+    """
+
+    tokenizer: _tokenizer.PaligemmaTokenizer
+    discrete_state_input: bool = False
+    use_state_input: bool = True
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+        if (subtask := data.pop("subtask", None)) is None:
+            raise ValueError("Subtask is required")
+
+        if self.use_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required when use_state_input=True.")
+        else:
+            state = None
+
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        if not isinstance(subtask, str):
+            subtask = subtask.item()
+
+        if self.use_state_input:
+            tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize_high_low_prompt_with_state(
+                prompt, subtask, state
+            )
+        else:
+            tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize_high_low_prompt(prompt, subtask)
+
+        return {
+            **data,
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_mask,
+            "token_ar_mask": ar_mask,
+            "token_loss_mask": loss_mask,
+        }
 
 
 @dataclasses.dataclass(frozen=True)

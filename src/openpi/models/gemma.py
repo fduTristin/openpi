@@ -156,7 +156,7 @@ class Embedder(nn.Module):
         )
 
     def encode(self, x):
-        x = self.input_embedding_table[(x,)]
+        x = jnp.take(self.input_embedding_table, x, axis=0)
         x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
         return x
 
@@ -169,6 +169,27 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+
+    def _init_cache(self, k, v, cache_size):
+        """Initialize KV cache"""
+        prefill_len = k.shape[1]
+        pad_width = ((0, 0), (0, cache_size - prefill_len), (0, 0), (0, 0))
+        cache_dtype =k.dtype  # self.cache_dtype or k.dtype
+        k_cache = jnp.pad(k.astype(cache_dtype), pad_width)
+        v_cache = jnp.pad(v.astype(cache_dtype), pad_width)
+        idx = jnp.zeros((k.shape[0],), dtype=jnp.int32) + prefill_len
+        return idx, k_cache, v_cache
+
+    def _update_cache(self, k, v, idx, k_cache, v_cache):
+        """Update KV cache with new values"""
+        assert k.shape[1] == 1, "Only support kv-cache updates of length 1"
+        indices = (0, idx[0], 0, 0)
+        cache_dtype = k.dtype  # self.cache_dtype or k.dtype
+        # jax.debug.breakpoint()
+        k_new = jax.lax.dynamic_update_slice(k_cache, k.astype(cache_dtype), indices)
+        v_new = jax.lax.dynamic_update_slice(v_cache, v.astype(cache_dtype), indices)
+        idx_new = idx + 1
+        return idx_new, k_new, v_new
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -218,10 +239,19 @@ class Attention(nn.Module):
         # should still be half-precision here (if input was half-precision)
         assert q.dtype == k.dtype == v.dtype == dtype
 
-        if kv_cache is not None:
-            cache_k, cache_v = kv_cache
-            k = jnp.concatenate([cache_k, k], axis=1)
-            v = jnp.concatenate([cache_v, v], axis=1)
+        if kv_cache is None:
+            idx, k_cache, v_cache = self._init_cache(k, v, attn_mask.shape[-1])
+            k, v = k_cache, v_cache
+        else:
+            idx, k_cache, v_cache = kv_cache
+            if k.shape[1] == 1: # Next token prediction, k,v length = 1
+                idx, k_cache, v_cache = self._update_cache(k, v, idx, k_cache, v_cache)
+                k, v = k_cache, v_cache
+            else: # Sample action, k,v length = action horizon; We don't update kv_cache here since it is no use
+                k = jnp.concatenate([k_cache, k], axis=1)
+                v = jnp.concatenate([v_cache, v], axis=1)
+
+        kv_cache = (idx, k_cache, v_cache)
 
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.configs[0].num_kv_heads)
         logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
@@ -256,7 +286,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, kv_cache
 
 
 @at.typecheck
@@ -343,7 +373,7 @@ class Block(nn.Module):
         return xs, kv_cache
 
 
-KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
+KVCache: TypeAlias = tuple[at.Int[at.Array, "l b"], at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
 
 
 @at.typecheck
@@ -356,6 +386,7 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    vocab_size: int = PALIGEMMA_VOCAB_SIZE
 
     def setup(self):
         # all experts must have the same depth
@@ -369,7 +400,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
-            static_argnums=(5,),  # 0=self, 6=deterministic
+            static_argnums=(5,),  # 0=self, 6=deterministic # TODO: 这里不一定是static argument了
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -394,6 +425,10 @@ class Module(nn.Module):
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
+
+    @at.typecheck
+    def deembed(self, embeddings: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        return self.embedder.decode(embeddings)
 
     @at.typecheck
     def __call__(

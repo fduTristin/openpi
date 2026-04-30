@@ -44,23 +44,34 @@ class Group:
     # Transforms that are applied to the model input data.
     inputs: Sequence[DataTransformFn] = ()
 
-    # Transforms that are applied to the model high-level input data.
+    # Transforms that are applied to the model high-level input data (Stage 1).
     high_level_inputs: Sequence[DataTransformFn] = ()
 
     # Transforms that are applied to the model output data.
     outputs: Sequence[DataTransformFn] = ()
 
-    def push(self, *, inputs: Sequence[DataTransformFn] = (), outputs: Sequence[DataTransformFn] = ()) -> "Group":
+    def push(
+        self,
+        *,
+        inputs: Sequence[DataTransformFn] = (),
+        high_level_inputs: Sequence[DataTransformFn] = (),
+        outputs: Sequence[DataTransformFn] = (),
+    ) -> "Group":
         """Append transforms to the group and return a new group.
 
         Args:
             inputs: Appended to the *end* of the current input transforms.
+            high_level_inputs: Appended to the *end* of the current high-level input transforms.
             outputs: Appended to the *beginning* of the current output transforms.
 
         Returns:
             A new group with the appended transforms.
         """
-        return Group(inputs=(*self.inputs, *inputs), outputs=(*outputs, *self.outputs))
+        return Group(
+            inputs=(*self.inputs, *inputs),
+            high_level_inputs=(*self.high_level_inputs, *high_level_inputs),
+            outputs=(*outputs, *self.outputs),
+        )
 
 
 @dataclasses.dataclass(frozen=True)

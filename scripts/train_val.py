@@ -107,7 +107,15 @@ def _create_validation_data_loader(
 
         def __iter__(self):
             for batch in self._torch_data_loader:
-                yield _model.Observation.from_dict(batch), batch["actions"]
+                if isinstance(batch, tuple):
+                    # Two-stage output: (stage1_dict, stage2_dict, actions)
+                    stage1_dict, stage2_dict = batch
+                    obs_stage1 = _model.Observation.from_dict(stage1_dict)
+                    obs_stage2 = _model.Observation.from_dict(stage2_dict)
+                    yield (obs_stage1, obs_stage2), stage2_dict["actions"]
+                else:
+                    # Legacy single-observation output
+                    yield _model.Observation.from_dict(batch), batch["actions"]
 
     val_dataset = _data_loader.create_behavior_dataset(actual_val_data_config, val_config.model.action_horizon)
     logging.info(f"Validation dataset created for {actual_val_data_config.repo_id}")
@@ -138,23 +146,23 @@ def _compute_validation_losses(
 ) -> float | None:
     """Compute validation losses over multiple batches."""
 
-    # Define validation loss function (similar to train_step structure)
-    @at.typecheck
-    def val_loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
-        return jnp.mean(chunked_loss)
-
     def validation_step(state, batch, rng):
-        """Single validation step, aligned with train_step structure."""
+        """Single validation step. Supports both single-stage and two-stage batches."""
         model = nnx.merge(state.model_def, state.params)
         model.eval()
 
-        observation, actions = batch
         val_rng = jax.random.fold_in(rng, state.step)
+        observation, actions = batch
 
-        return val_loss_fn(model, val_rng, observation, actions)
+        if isinstance(observation, tuple):
+            obs_stage1, obs_stage2 = observation
+            loss = jnp.mean(
+                model.compute_loss(val_rng, obs_stage2, actions, train=False, obs_stage1=obs_stage1)
+            )
+        else:
+            loss = jnp.mean(model.compute_loss(val_rng, observation, actions, train=False))
+
+        return loss
 
     # JIT compile the validation step
     pvalidation_step = jax.jit(
@@ -339,24 +347,36 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation | tuple[_model.Observation, _model.Observation], _model.Actions],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck
-    def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
-
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
-    # Filter out frozen params.
-    diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    # Detect two-stage vs single-stage batch format.
+    # Two-stage: ((obs_stage1, obs_stage2), actions) where obs_stage1 has token_loss_mask
+    # Single-stage: (obs, actions)
+    if isinstance(observation, tuple):
+        obs_stage1, obs_stage2 = observation
+
+        diff_state = nnx.DiffState(0, config.trainable_filter)
+        loss, grads = nnx.value_and_grad(
+            lambda m, rng, obs2, obs1, actions: jnp.mean(
+                m.compute_loss(rng, obs2, actions, train=True, obs_stage1=obs1)
+            ),
+            argnums=diff_state,
+        )(model, train_rng, obs_stage2, obs_stage1, actions)
+    else:
+        # Legacy single-stage path (backwards compatible)
+        @at.typecheck
+        def loss_fn(model, rng, observation, actions):
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss)
+
+        diff_state = nnx.DiffState(0, config.trainable_filter)
+        loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -426,12 +446,15 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
+
+    # Extract observation for logging (works for both single and two-stage batches)
+    obs_for_logging = batch[0][0] if isinstance(batch[0], tuple) else batch[0]
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        wandb.Image(np.concatenate([np.array(img[i]) for img in obs_for_logging.images.values()], axis=1))
+        for i in range(min(5, len(next(iter(obs_for_logging.images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 

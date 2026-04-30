@@ -69,7 +69,7 @@ class PaligemmaTokenizer:
         if cleaned_low_text and cleaned_low_text[-1] in string.punctuation:
             cleaned_low_text = cleaned_low_text[:-1]
         cleaned_low_text += '.'  # Add your custom symbol here
-        sub_prompt_2 = f"{cleaned_low_text};\nAction: " # Warning: State is not included here which is different from original pi05
+        sub_prompt_2 = f"{cleaned_low_text}" # Warning: State is not included here which is different from original pi05
         tokens_2 = self._tokenizer.encode(sub_prompt_2, add_eos=True)
         ar_mask += [1] * len(tokens_2)
         loss_mask += [True] * len(tokens_2)
@@ -122,7 +122,7 @@ class PaligemmaTokenizer:
         if cleaned_low_text and cleaned_low_text[-1] in string.punctuation:
             cleaned_low_text = cleaned_low_text[:-1]
         cleaned_low_text += "."
-        sub_prompt_2 = f"{cleaned_low_text};\nAction: "
+        sub_prompt_2 = f"{cleaned_low_text}"
         tokens_2 = self._tokenizer.encode(sub_prompt_2, add_eos=True)
         ar_mask += [1] * len(tokens_2)
         loss_mask += [True] * len(tokens_2)

@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import copy
 import logging
 import multiprocessing
 import os
@@ -57,6 +58,35 @@ class TransformedDataset(Dataset[T_co]):
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         return self._transform(self._dataset[index])
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class TwoStageTransformedDataset(Dataset):
+    """Applies two separate transform pipelines to produce (obs_stage1, obs_stage2, actions).
+
+    Used when training jointly on Stage 1 (high-level subtask CE loss) and Stage 2 (low-level
+    action diffusion loss). Each pipeline independently applies the full transform chain.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        stage2_transforms: Sequence[_transforms.DataTransformFn],
+        stage1_transforms: Sequence[_transforms.DataTransformFn],
+    ):
+        self._dataset = dataset
+        self._stage2_transform = _transforms.compose(stage2_transforms)
+        self._stage1_transform = _transforms.compose(stage1_transforms)
+
+    def __getitem__(self, index: SupportsIndex) -> tuple[dict, dict, dict]:
+        sample = self._dataset[index]
+        stage2 = self._stage2_transform(copy.deepcopy(sample))
+        stage2.pop("subtask", None)
+        stage1 = self._stage1_transform(copy.deepcopy(sample))
+        return stage1, stage2
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -134,7 +164,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     dataset = BehaviorLeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
-        tasks=["picking_up_trash"],  
+        tasks=["turning_on_radio"],  
         modalities=["rgb"],
         local_only=True,
         delta_timestamps={
@@ -195,7 +225,14 @@ def create_rlds_dataset(
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
-    """Transform the dataset by applying the data transforms."""
+    """Transform the dataset by applying the data transforms.
+
+    Applies two separate transform pipelines:
+    1. Stage 2 (low-level action): `inputs` pipeline → `Observation` for `compute_loss`
+    2. Stage 1 (high-level subtask): `high_level_inputs` pipeline → `Observation` for `compute_CE_loss`
+
+    Each pipeline independently applies: repack → data_transforms → normalize → model_transforms.
+    """
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
@@ -205,13 +242,34 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
+    has_high_level = bool(data_config.model_transforms.high_level_inputs)
+
+    if not has_high_level:
+        # Legacy path: single-observation output (backwards compatible)
+        return TransformedDataset(
+            dataset,
+            [
+                *data_config.repack_transforms.inputs,
+                *data_config.data_transforms.inputs,
+                _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+                *data_config.model_transforms.inputs,
+            ],
+        )
+
+    # New path: apply both Stage 1 and Stage 2 pipelines independently
+    return TwoStageTransformedDataset(
         dataset,
-        [
+        stage2_transforms=[
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
+        ],
+        stage1_transforms=[
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.high_level_inputs,
         ],
     )
 
@@ -587,4 +645,12 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            if isinstance(batch, tuple):
+                # Two-stage output: (stage1_dict, stage2_dict)
+                stage1_dict, stage2_dict = batch
+                obs_stage1 = _model.Observation.from_dict(stage1_dict)
+                obs_stage2 = _model.Observation.from_dict(stage2_dict)
+                yield (obs_stage1, obs_stage2), stage2_dict["actions"]
+            else:
+                # Legacy single-observation output
+                yield _model.Observation.from_dict(batch), batch["actions"]

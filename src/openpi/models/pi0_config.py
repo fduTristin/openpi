@@ -29,6 +29,9 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # Weight for the CE loss in two-stage training (Stage 1 subtask generation).
+    # Only used when pi05=True and obs_stage1 is passed to compute_loss.
+    ce_loss_weight: float = 0.1
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 

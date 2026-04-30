@@ -127,6 +127,7 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+        self.ce_loss_weight = config.ce_loss_weight
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -250,7 +251,14 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        obs_stage1: _model.Observation | None = None,
+        ce_loss_weight: float | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -274,7 +282,44 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        diffusion_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+        if obs_stage1 is not None:
+            weight = ce_loss_weight if ce_loss_weight is not None else self.ce_loss_weight
+            ce_loss = self._compute_CE_loss(preprocess_rng, obs_stage1, train=train)
+            return jnp.mean(diffusion_loss) + weight * ce_loss
+
+        return diffusion_loss
+
+    def _compute_CE_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        """CE loss for subtask generation (Stage 1)."""
+        observation = _model.preprocess_observation(rng, observation, train=train)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_high_level_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+
+        targets = jax.nn.one_hot(
+            observation.tokenized_prompt[:, 1:],
+            self.PaliGemma.llm.module.vocab_size,
+        )
+
+        prefix_positions = jnp.cumsum(prefix_mask, axis=-1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions, adarms_cond=[None, None]
+        )
+        prefix_out = prefix_out[:, :-1]
+
+        logits = self.PaliGemma.llm(
+            prefix_out[:, -targets.shape[1] :], method="deembed"
+        )
+        logp = jax.nn.log_softmax(logits, axis=-1)
+
+        assert observation.token_loss_mask is not None, "Token loss mask is required"
+        loss_mask = observation.token_loss_mask[:, 1:]
+        token_pplx = jnp.sum(targets * logp, axis=-1)
+
+        return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
 
     @override
     def sample_low_level_task(

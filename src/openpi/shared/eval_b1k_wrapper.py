@@ -26,6 +26,7 @@ class B1KPolicyWrapper():
         self.max_len = 50                     # how long the policy sequences are
         self.temporal_ensemble_max = 5        # max number of sequences to ensemble
         self.step_counter = 0
+        self.subtask = None
     
     def reset(self):
         self.action_queue = deque([],maxlen=self.action_horizon)
@@ -85,6 +86,7 @@ class B1KPolicyWrapper():
             try:
                 action = self.policy.infer(batch)
                 self.last_action = action
+                self.subtask = action.get("subtask", None)
             except Exception as e:
                 action = self.last_action
                 print(f"Error in action prediction, using last action: {e}")
@@ -125,7 +127,7 @@ class B1KPolicyWrapper():
 
         self.step_counter += 1
 
-        return final_action
+        return final_action, self.subtask
 
 
     def act(self, input_obs):
@@ -166,7 +168,7 @@ class B1KPolicyWrapper():
             if len(self.action_queue) > 0:
                 # pop the first action in the queue
                 final_action = self.action_queue.popleft()[None]
-                return torch.from_numpy(final_action)
+                return torch.from_numpy(final_action), self.subtask
         
         nbatch = copy.deepcopy(input_obs)
         if nbatch["observation"].shape[-1] != 3: 
@@ -186,9 +188,11 @@ class B1KPolicyWrapper():
         try:
             action = self.policy.infer(batch) 
             self.last_action = action
+            self.subtask = action.get("subtask", None)
         except Exception as e:
             action = self.last_action
             raise e
+
         # convert to absolute action and append gripper command
         # action shape: (10, 23), joint_positions shape: (23,)
         # Need to broadcast joint_positions to match action sequence length
@@ -217,4 +221,4 @@ class B1KPolicyWrapper():
             final_action = final_action[None]
         else:
             final_action = target_joint_positions
-        return torch.from_numpy(final_action)
+        return torch.from_numpy(final_action), self.subtask

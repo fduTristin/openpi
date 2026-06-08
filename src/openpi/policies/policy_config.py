@@ -16,6 +16,7 @@ import openpi.transforms as transforms
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
+    high_level_checkpoint_dir: pathlib.Path | str | None = None,
     *,
     repack_transforms: transforms.Group | None = None,
     sample_kwargs: dict[str, Any] | None = None,
@@ -44,17 +45,24 @@ def create_trained_policy(
     """
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
-
+    high_level_checkpoint_dir = download.maybe_download(str(high_level_checkpoint_dir)) if high_level_checkpoint_dir is not None else None
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
+    high_level_weight_path = os.path.join(high_level_checkpoint_dir, "model.safetensors") if high_level_checkpoint_dir is not None else None
     is_pytorch = os.path.exists(weight_path)
+    high_level_model = None
 
     logging.info("Loading model...")
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        if high_level_checkpoint_dir is not None:
+            high_level_model = train_config.model.load_pytorch(train_config, high_level_weight_path)
+            high_level_model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+        if high_level_checkpoint_dir is not None:
+            high_level_model = train_config.model.load(_model.restore_params(high_level_checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
@@ -74,12 +82,20 @@ def create_trained_policy(
 
     return _policy.Policy(
         model,
+        high_level_model,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
+        ],
+        high_level_transforms=[
+            *repack_transforms.inputs,
+            transforms.InjectDefaultPrompt(default_prompt),
+            *data_config.data_transforms.inputs,
+            transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *data_config.model_transforms.high_level_inputs,
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,

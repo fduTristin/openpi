@@ -107,7 +107,15 @@ def _create_validation_data_loader(
 
         def __iter__(self):
             for batch in self._torch_data_loader:
-                yield _model.Observation.from_dict(batch), batch["actions"]
+                if isinstance(batch, tuple):
+                    # Two-stage output: (stage1_dict, stage2_dict, actions)
+                    stage1_dict, stage2_dict = batch
+                    obs_stage1 = _model.Observation.from_dict(stage1_dict)
+                    obs_stage2 = _model.Observation.from_dict(stage2_dict)
+                    yield (obs_stage1, obs_stage2), stage2_dict["actions"]
+                else:
+                    # Legacy single-observation output
+                    yield _model.Observation.from_dict(batch), batch["actions"]
 
     val_dataset = _data_loader.create_behavior_dataset(actual_val_data_config, val_config.model.action_horizon)
     logging.info(f"Validation dataset created for {actual_val_data_config.repo_id}")
@@ -135,26 +143,33 @@ def _compute_validation_losses(
     train_state_sharding: jax.sharding.NamedSharding,
     replicated_sharding: jax.sharding.NamedSharding,
     config: _config.TrainConfig,
-) -> float | None:
-    """Compute validation losses over multiple batches."""
-
-    # Define validation loss function (similar to train_step structure)
-    @at.typecheck
-    def val_loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
-        return jnp.mean(chunked_loss)
+) -> tuple[float | None, float | None, float | None]:
+    """Compute validation losses over multiple batches. Returns (total, diffusion, ce)."""
 
     def validation_step(state, batch, rng):
-        """Single validation step, aligned with train_step structure."""
+        """Single validation step. Supports both single-stage and two-stage batches."""
         model = nnx.merge(state.model_def, state.params)
         model.eval()
 
-        observation, actions = batch
         val_rng = jax.random.fold_in(rng, state.step)
+        observation, actions = batch
 
-        return val_loss_fn(model, val_rng, observation, actions)
+        if isinstance(observation, tuple):
+            obs_stage1, obs_stage2 = observation
+            losses = model.compute_loss(val_rng, actions, train=False, obs_stage1=obs_stage1, obs_stage2=obs_stage2)
+        else:
+            losses = model.compute_loss(val_rng, observation, actions, train=False)
+
+        if isinstance(losses, dict):
+            total = losses["loss"]
+            ce = losses["ce_loss"]
+            fm = losses["fm_loss"]
+        else:
+            total = losses
+            ce = jnp.zeros(())
+            fm = jnp.zeros(())
+
+        return total, ce, fm
 
     # JIT compile the validation step
     pvalidation_step = jax.jit(
@@ -164,7 +179,9 @@ def _compute_validation_losses(
     )
 
     val_iter = iter(val_loader)
-    losses = []
+    total_losses = []
+    ce_losses = []
+    fm_losses = []
     # Use a separate RNG for validation to avoid interference with training RNG,
     # the specific seed offset is arbitrary.
     val_rng = jax.random.key(config.seed + 1000)
@@ -177,15 +194,17 @@ def _compute_validation_losses(
 
         try:
             with sharding.set_mesh(mesh):
-                loss = pvalidation_step(train_state, batch, val_rng)
-            losses.append(jax.device_get(loss))
+                total, ce, fm = pvalidation_step(train_state, batch, val_rng)
+            total_losses.append(jax.device_get(total))
+            ce_losses.append(jax.device_get(ce))
+            fm_losses.append(jax.device_get(fm))
         except (RuntimeError, ValueError) as e:
             logging.warning("Error computing validation loss for batch %d: %s", batch_idx, e)
             continue
 
-    if not losses:
-        return None
-    return float(jnp.mean(jnp.array(losses)))
+    if not total_losses:
+        return None, None, None
+    return float(jnp.mean(jnp.array(total_losses))), float(jnp.mean(jnp.array(ce_losses))), float(jnp.mean(jnp.array(fm_losses)))
 
 
 def compute_validation_loss(
@@ -195,8 +214,8 @@ def compute_validation_loss(
     train_state_sharding: jax.sharding.NamedSharding,
     replicated_sharding: jax.sharding.NamedSharding,
     train_data_loader: _data_loader.DataLoader | None = None,
-) -> float | None:
-    """Compute average validation loss over a few batches. Downloads validation dataset if missing locally."""
+) -> tuple[float | None, float | None, float | None]:
+    """Compute average validation losses over a few batches. Returns (total, ce, fm). Downloads validation dataset if missing locally."""
     # Extract training normalization stats
     training_norm_stats = _extract_training_norm_stats(train_data_loader)
 
@@ -207,7 +226,7 @@ def compute_validation_loss(
         )
     except ValueError:
         logging.warning("Could not determine validation repository ID, skipping validation loss.")
-        return None
+        return None, None, None
 
     # Check if validation dataset exists locally (same behavior as training dataset)
     is_local = True
@@ -222,7 +241,7 @@ def compute_validation_loss(
     except Exception as e:
         logging.warning(f"Failed to create validation data loader for {repo_id}: {e}")
         logging.warning("Skipping validation loss computation.")
-        return None
+        return None, None, None
 
     # Compute and return validation losses
     return _compute_validation_losses(val_loader, train_state, mesh, train_state_sharding, replicated_sharding, config)
@@ -339,24 +358,47 @@ def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    batch: tuple[_model.Observation | tuple[_model.Observation, _model.Observation], _model.Actions],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck
-    def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
-
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
-    # Filter out frozen params.
-    diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    info = {}
+
+    # Detect two-stage vs single-stage batch format.
+    # Two-stage: ((obs_stage1, obs_stage2), actions) where obs_stage1 has token_loss_mask
+    # Single-stage: (obs, actions)
+    if isinstance(observation, tuple):
+        obs_stage1, obs_stage2 = observation
+
+        diff_state = nnx.DiffState(0, config.trainable_filter)
+        # Single forward pass. Use has_aux to return component losses without
+        # computing gradients for them — avoids the redundant second forward.
+        def loss_fn(m, rng, obs1, obs2, actions):
+            losses = m.compute_loss(rng, actions, train=True, obs_stage1=obs1, obs_stage2=obs2)
+            return jnp.mean(losses["loss"]), losses
+
+        (loss, component_losses), grads = nnx.value_and_grad(
+            loss_fn, argnums=diff_state, has_aux=True
+        )(model, train_rng, obs_stage1, obs_stage2, actions)
+        info["train/loss"] = loss
+        info["train/ce_loss"] = component_losses["ce_loss"]
+        info["train/fm_loss"] = component_losses["fm_loss"]
+        info["train/grad_norm"] = optax.global_norm(grads)
+    else:
+        # Legacy single-stage path (backwards compatible)
+        @at.typecheck
+        def loss_fn(model, rng, observation, actions):
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            return jnp.mean(chunked_loss) if not isinstance(chunked_loss, dict) else jnp.mean(chunked_loss["total"])
+
+        diff_state = nnx.DiffState(0, config.trainable_filter)
+        loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+        info["train/loss"] = loss
+        info["train/grad_norm"] = optax.global_norm(grads)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -384,11 +426,7 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
-    info = {
-        "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
-    }
+    info["train/param_norm"] = optax.global_norm(kernel_params)
     return new_state, info
 
 
@@ -426,12 +464,15 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
+
+    # Extract observation for logging (works for both single and two-stage batches)
+    obs_for_logging = batch[0][0] if isinstance(batch[0], tuple) else batch[0]
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        wandb.Image(np.concatenate([np.array(img[i]) for img in obs_for_logging.images.values()], axis=1))
+        for i in range(min(5, len(next(iter(obs_for_logging.images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
@@ -470,12 +511,15 @@ def main(config: _config.TrainConfig):
             wandb.log(reduced_info, step=step)
             infos = []
         if step % config.val_log_interval == 0:
-            val_loss = compute_validation_loss(
+            val_total, val_ce, val_fm = compute_validation_loss(
                 config, train_state, mesh, train_state_sharding, replicated_sharding, data_loader
             )
-            if val_loss is not None:
-                wandb.log({"val_loss": val_loss}, step=step)
-                logging.info("Validation loss at step %d: %.4f", step, val_loss)
+            if val_total is not None:
+                wandb.log(
+                    {"val/loss": val_total, "val/ce_loss": val_ce, "val/fm_loss": val_fm},
+                    step=step,
+                )
+                logging.info("Validation loss at step %d: total=%.4f, ce=%.4f, fm=%.4f", step, val_total, val_ce, val_fm)
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:

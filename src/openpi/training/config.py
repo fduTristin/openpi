@@ -142,6 +142,16 @@ class ModelTransformFactory(GroupFactory):
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
+                    high_level_inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizeHighLowPrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                            use_state_input=False
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
                 )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
@@ -379,6 +389,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "subtask": "subtask",
                     }
                 )
             ]
@@ -719,6 +730,7 @@ _CONFIGS = [
         num_workers=min(32, os.cpu_count() - 2),
     ),
 
+    # default config for low-level training, only generating actions
     TrainConfig(
         name="pi05_b1k",
         exp_name="openpi",
@@ -738,14 +750,75 @@ _CONFIGS = [
             pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora"
         ).get_freeze_filter(),
         ema_decay=None,
-        val_log_interval=5000,
+        save_interval=10_000,
+        val_log_interval=1000,
         val_repo_id="behavior-1k/2025-challenge-demos",
         val_episodes_index=list(range(190, 200)),
         assets_base_dir="./outputs/assets",
-        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=min(32, os.cpu_count() - 2),
+    ),
+
+    # config for high-level training, only generating subtask
+    TrainConfig(
+        name="pi05_b1k_high_level",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora", training_mode="high-level"),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root="/mnt/sdb/xhz/Datasets/behavior/2025-challenge-demos",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora", training_mode="high-level"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        save_interval=10_000,
+        val_log_interval=1000,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=min(32, os.cpu_count() - 2),
+    ),
+
+    # config for both high-level and low-level training, generating subtask and actions
+    # ce_loss_weight is used to balance the two losses
+    TrainConfig(
+        name="pi05_b1k_both",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora", ce_loss_weight=0.1, training_mode="both"),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(190)),
+                behavior_dataset_root="/mnt/sdb/xhz/Datasets/behavior/2025-challenge-demos",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora", ce_loss_weight=0.05, training_mode="both"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        save_interval=10_000,
+        val_log_interval=1000,
+        val_repo_id="behavior-1k/2025-challenge-demos",
+        val_episodes_index=list(range(190, 200)),
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
         num_workers=min(32, os.cpu_count() - 2),
     ),
     
+    # config for zero-shot inference, without LoRA weights
     TrainConfig(
         name="pi05_b1k_zero_shot",
         exp_name="openpi",
@@ -762,7 +835,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=50_000,
         freeze_filter=pi0_config.Pi0Config(
-            pi05=True, action_horizon=50, paligemma_variant="gemma_2b_lora"
+            pi05=True, action_horizon=50, paligemma_variant="gemma_2b"
         ).get_freeze_filter(),
         ema_decay=None,
         val_log_interval=5000,

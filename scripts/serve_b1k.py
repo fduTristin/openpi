@@ -33,6 +33,7 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    high_level_checkpoint_dir: str | None = None
 
 
 @dataclasses.dataclass
@@ -68,7 +69,7 @@ class Args:
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     return _policy_config.create_trained_policy(
-        _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+        _config.get_config(args.policy.config), args.policy.dir, args.policy.high_level_checkpoint_dir, default_prompt=args.default_prompt
     )
 
 
@@ -108,7 +109,7 @@ def main(args: Args) -> None:
 
 if __name__ == "__main__":
     time_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    log_path = f"/home/xhz/logging/serve_b1k/"
+    log_path = f"logs/serve_b1k/"
     os.makedirs(log_path, exist_ok=True)
      
     logging.basicConfig(level=logging.INFO,

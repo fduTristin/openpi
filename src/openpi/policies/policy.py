@@ -17,6 +17,9 @@ from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
+from openpi.models import tokenizer as _tokenizer
+
+from PIL import Image
 
 BasePolicy: TypeAlias = _base_policy.BasePolicy
 
@@ -25,9 +28,11 @@ class Policy(BasePolicy):
     def __init__(
         self,
         model: _model.BaseModel,
+        high_level_model: _model.BaseModel,
         *,
         rng: at.KeyArrayLike | None = None,
         transforms: Sequence[_transforms.DataTransformFn] = (),
+        high_level_transforms: Sequence[_transforms.DataTransformFn] = (),
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
@@ -48,7 +53,9 @@ class Policy(BasePolicy):
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
         self._model = model
+        self._high_level_model = high_level_model
         self._input_transform = _transforms.compose(transforms)
+        self._high_level_input_transform = _transforms.compose(high_level_transforms)
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
@@ -57,26 +64,129 @@ class Policy(BasePolicy):
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
+            self._high_level_model = self._high_level_model.to(pytorch_device)
             self._model.eval()
+            self._high_level_model.eval()
             self._sample_actions = model.sample_actions
+            if high_level_model is not None:
+                self._sample_low_level_task = nnx_utils.module_jit(high_level_model.sample_low_level_task, static_argnums=(3,))
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            if high_level_model is not None:
+                self._sample_low_level_task = nnx_utils.module_jit(high_level_model.sample_low_level_task, static_argnums=(3,))
             self._rng = rng or jax.random.key(0)
-
+    
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
-        # Make a copy since transformations may modify the inputs in place.
+        if not self._is_pytorch_model:
+            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+        else:
+            sample_rng_or_pytorch_device = self._pytorch_device
+
+        stage2_subtask = None
+        start_time = time.monotonic()
+
+        # two stage inference -- generate subtask & sample actions
+        # stage 1: use the dedicated high-level transform pipeline to prepare model inputs.
+        if self._high_level_model is not None:
+            high_level_inputs = jax.tree.map(lambda x: x, obs)
+            # Placeholder low-level subtask required by TokenizeHighLowPrompt.
+            high_level_inputs["subtask"] = np.asarray("ABCDEFG")
+            high_level_inputs = self._high_level_input_transform(high_level_inputs)
+            if not self._is_pytorch_model:
+                high_level_inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], high_level_inputs)
+                high_level_rng = sample_rng_or_pytorch_device
+            else:
+                high_level_inputs = jax.tree.map(
+                    lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], high_level_inputs
+                )
+                high_level_rng = sample_rng_or_pytorch_device
+
+            observation = _model.Observation.from_dict(high_level_inputs)
+            observation = _model.preprocess_observation(
+                high_level_rng if not self._is_pytorch_model else None,
+                observation,
+                train=False,
+                image_keys=list(observation.images.keys()),
+            )
+            
+            # Set the low level task tokens to padding according to the loss mask (loss mask is the indication of low-level prompt)
+            # We move it from inside model to outside because the inside func need to be jittable
+            loss_mask = jnp.array(observation.token_loss_mask)
+            new_tokenized_prompt = observation.tokenized_prompt.at[loss_mask].set(0)
+            new_tokenized_prompt_mask = observation.tokenized_prompt_mask.at[loss_mask].set(False)
+            new_observation = _model.Observation(
+                                images=observation.images,
+                                image_masks=observation.image_masks,
+                                state=observation.state,
+                                tokenized_prompt=new_tokenized_prompt,
+                                tokenized_prompt_mask=new_tokenized_prompt_mask,
+                                token_ar_mask=observation.token_ar_mask,
+                                token_loss_mask=observation.token_loss_mask,
+                                )
+            new_observation = _model.preprocess_observation(None, new_observation, train=False)
+            PALIGEMMA_EOS_TOKEN = 1
+            max_decoding_steps = 25
+            temperature = 0.1
+            predicted_texts = []
+            if not self._is_pytorch_model:
+                _predicted_token, _kv_cache, _mask, _ar_mask = self._sample_low_level_task(
+                    high_level_rng, new_observation, max_decoding_steps, PALIGEMMA_EOS_TOKEN, temperature
+                )
+                predicted_token_np = np.array(_predicted_token)
+                tokenizer = _tokenizer.PaligemmaTokenizer(max_len=max(observation.tokenized_prompt.shape[-1], max_decoding_steps))
+                predicted_texts = [
+                    tokenizer.detokenize(np.asarray(predicted_token_np[i], dtype=np.int32))
+                    for i in range(predicted_token_np.shape[0])
+                ]
+                logging.info("[HighLevel] predicted_text=%s", predicted_texts)
+                print(f"[HighLevel] predicted_text={predicted_texts}", flush=True)
+            else:
+                logging.info("[HighLevel] skipped stage-1 decode for PyTorch model.")
+                print("[HighLevel] skipped stage-1 decode for PyTorch model.", flush=True)
+            stage2_subtask = " ".join(predicted_texts) if predicted_texts else None
+        # =======================================================================================
+        # stage 2: sample actions, now uses the subtask generated at stage 1
         inputs = jax.tree.map(lambda x: x, obs)
+        
+        # extract image from inputs and save for debugging
+        if 'observation/egocentric_camera' in inputs:
+            img = inputs['observation/egocentric_camera']
+            # save image for debugging
+            if isinstance(img, jnp.ndarray):
+                img = np.array(img)
+            img = Image.fromarray(img.astype('uint8'))
+            img.save('base_0_rgb.png')
+        
+        # if 'observation/wrist_image_left' in inputs:
+        #     img = inputs['observation/wrist_image_left']
+        #     # save image for debugging
+        #     if isinstance(img, jnp.ndarray):
+        #         img = np.array(img)
+        #     img = Image.fromarray(img.astype('uint8'))
+        #     img.save('left_wrist_0_rgb.png')
+        
+        # if 'observation/wrist_image_right' in inputs:
+        #     img = inputs['observation/wrist_image_right']
+        #     # save image for debugging
+        #     if isinstance(img, jnp.ndarray):
+        #         img = np.array(img)
+        #     img = Image.fromarray(img.astype('uint8'))
+        #     img.save('right_wrist_0_rgb.png')
+        
+        # Inject stage-1 generated subtask as the prompt for stage 2.
+        # Stage 2 uses the standard input_transform (TokenizePrompt), NOT the high-level
+        # tokenizer (TokenizeHighLowPrompt) — if `subtask` exists, `prompt` will be replaced with `subtask` in `TokenizePrompt` method.
+        inputs["subtask"] = np.asarray(stage2_subtask) if isinstance(stage2_subtask, str) else stage2_subtask
         inputs = self._input_transform(inputs)
+
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
-            sample_rng_or_pytorch_device = self._pytorch_device
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
@@ -88,7 +198,6 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
-        start_time = time.monotonic()
         outputs = {
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
@@ -103,6 +212,8 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        logging.info(f"Policy timing: {outputs['policy_timing']}")
+        outputs["subtask"] = stage2_subtask
         return outputs
 
     @property

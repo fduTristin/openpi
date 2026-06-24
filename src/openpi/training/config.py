@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.xlerobot_policy as xlerobot_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -90,12 +92,18 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Episodes index to use for training. If None, all episodes are used.
+    episodes_index: list[int] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    # Only used for XLeRobot data loader.
+    xlerobot_dataset_root: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -197,6 +205,7 @@ class DataConfigFactory(abc.ABC):
             return norm_stats
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+            print(f"Norm stats not found in {data_assets_dir}, skipping.")
         return None
 
 
@@ -459,6 +468,54 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class XLeRobotDataConfig(DataConfigFactory):
+    """
+    Data config for XLeRobot datasets.
+
+    Adapts the XLeRobot LeRobot-format data to pi0/pi0.5 model inputs and outputs.
+    The `data_transforms` use the transforms defined in `xlerobot_policy.py`.
+    """
+
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Remap dataset keys to the intermediate names expected by xlerobot_policy.
+        repack_transform = _transforms.Group(
+            # inputs=[
+            #     _transforms.RepackTransform(
+            #         {
+            #             "observation/state": "observation/state",
+            #             "observation/image_head": "observation/images/head",
+            #             "observation/image_left_wrist": "observation/images/left_wrist",
+            #             "observation/image_right_wrist": "observation/images/right_wrist",
+            #             "actions": "actions",
+            #             "prompt": "prompt",
+            #         }
+            #     )
+            # ]
+        )
+
+        # Convert XLeRobot observations to model inputs; passthrough actions.
+        data_transforms = _transforms.Group(
+            inputs=[xlerobot_policy.XLeRobotInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[xlerobot_policy.XLeRobotOutputs(action_dim=17)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            use_quantile_norm=True,
         )
 
 
@@ -964,6 +1021,41 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    #
+    # XLeRobot fine-tuning configs.
+    #
+    TrainConfig(
+        name="pi05_xlerobot",
+        exp_name="openpi",
+        project_name="XLeRobot",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+        ),
+        data=XLeRobotDataConfig(
+            repo_id="pick_and_place",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(8)) + list(range(9, 26)), # range(26) without 8
+                xlerobot_dataset_root="/mnt/sdb/xhz/Datasets/xlerobot",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=8,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        save_interval=5_000,
+        log_interval=100,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=min(32, os.cpu_count() - 2) if hasattr(os, "cpu_count") else 4,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

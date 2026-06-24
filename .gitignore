@@ -3,6 +3,8 @@ assets/
 checkpoints/
 data/
 wandb/
+debug/
+outputs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

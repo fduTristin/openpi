@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.xlerobot_dataset import XLeRobotDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -127,6 +128,31 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def create_xlerobot_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+) -> Dataset:
+    """Create a dataset for training on XLeRobot data."""
+    if data_config.xlerobot_dataset_root is None:
+        raise ValueError("xlerobot_dataset_root must be set for XLeRobot dataset.")
+
+    fps = 30
+    root = data_config.xlerobot_dataset_root
+    if data_config.repo_id:
+        root = os.path.join(root, data_config.repo_id)
+    dataset = XLeRobotDataset(
+        root=root,
+        episodes=data_config.episodes_index,
+        delta_timestamps={
+            key: [t / fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+    )
+
+    if data_config.prompt_from_task and dataset.tasks:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.tasks)])
+
+    return dataset
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -176,7 +202,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+                "Make sure to run `scripts/compute_norm_stats.py --config-name <your-config>`."
             )
         norm_stats = data_config.norm_stats
 
@@ -266,6 +292,43 @@ def create_data_loader(
         skip_norm_stats=skip_norm_stats,
         framework=framework,
     )
+
+
+def create_xlerobot_data_loader(
+    config: _config.TrainConfig,
+    data_config: _config.DataConfig | None = None,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    skip_norm_stats: bool = False
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a data loader for XLeRobot dataset training.
+
+    Args:
+        config: The training configuration (provides batch_size, num_workers, seed, model.action_horizon).
+        data_config: Optional DataConfig. If None, creates one from config.data.create().
+        sharding: JAX sharding.
+        shuffle: Whether to shuffle the data.
+        num_batches: Number of batches to return.
+        skip_norm_stats: Whether to skip normalization.
+        framework: "jax" or "pytorch".
+    """
+    data_config = config.data.create(config.assets_dirs, config.model)
+    dataset = create_xlerobot_dataset(data_config, action_horizon=config.model.action_horizon)
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=config.batch_size // jax.process_count(),
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed,
+    )
+
+    return DataLoaderImpl(data_config, data_loader)
 
 
 def create_torch_data_loader(

@@ -35,10 +35,10 @@ class XLeRobotInputs(transforms.DataTransformFn):
     """Transform XLeRobot observations into model inputs.
 
     Expects the following keys in the input dict (after repack):
-        - observation/state:       (17,) raw joint/state vector
-        - observation/image_head:  head camera image (H,W,C,3) or (3,H,W)
-        - observation/image_left_wrist:  left wrist image
-        - observation/image_right_wrist:  right wrist image
+        - observation.state:       (17,) raw joint/state vector
+        - observation.images.head:  head camera image (H,W,C,3) or (3,H,W)
+        - observation.images.left_wrist:  left wrist image
+        - observation.images.right_wrist:  right wrist image
 
     Produces:
         - state:        (23,) joint state (arm joints + base + gripper)
@@ -51,13 +51,15 @@ class XLeRobotInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
-        state = np.asarray(data["observation/state"], dtype=np.float32)
+        # list data keys
+        # print(data.keys())
+        state = np.asarray(data["observation.state"], dtype=np.float32)
         if state.shape[-1] != self.action_dim:
             state = np.pad(state, ((0, self.action_dim - state.shape[-1])), mode="constant")
 
-        base_image = _parse_image(data["observation/image_head"])
-        wrist_image_left = _parse_image(data["observation/image_left_wrist"])
-        wrist_image_right = _parse_image(data["observation/image_right_wrist"])
+        base_image = _parse_image(data["observation.images.head"])
+        wrist_image_left = _parse_image(data["observation.images.left_wrist"])
+        wrist_image_right = _parse_image(data["observation.images.right_wrist"])
 
         match self.model_type:
             case _model.ModelType.PI0 | _model.ModelType.PI05:
@@ -77,8 +79,8 @@ class XLeRobotInputs(transforms.DataTransformFn):
             "image_mask": dict(zip(names, image_masks, strict=True)),
         }
 
-        if "actions" in data:
-            inputs["actions"] = data["actions"]
+        if "action" in data:
+            inputs["actions"] = data["action"]
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
@@ -107,9 +109,9 @@ class XLeRobotOutputs(transforms.DataTransformFn):
 def make_xlerobot_example() -> dict:
     """Creates a random input example for the XLeRobot policy."""
     return {
-        "observation/state": np.random.rand(17).astype(np.float32),
-        "observation/image_head": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
-        "observation/image_left_wrist": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
-        "observation/image_right_wrist": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+        "observation.state": np.random.rand(17).astype(np.float32),
+        "observation.images.head": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+        "observation.images.left_wrist": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
+        "observation.images.right_wrist": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
         "prompt": "pick and place the object",
     }

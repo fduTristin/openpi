@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import numpy as np
 import torch
 
@@ -140,16 +140,20 @@ def create_xlerobot_dataset(
     root = data_config.xlerobot_dataset_root
     if data_config.repo_id:
         root = os.path.join(root, data_config.repo_id)
-    dataset = XLeRobotDataset(
+    dataset = LeRobotDataset(
+        repo_id=data_config.repo_id,
         root=root,
         episodes=data_config.episodes_index,
         delta_timestamps={
             key: [t / fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    
+    dataset_meta = LeRobotDatasetMetadata(data_config.repo_id, root=root)
+    print(f"metadata.tasks: {dataset_meta.tasks}")
 
-    if data_config.prompt_from_task and dataset.tasks:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset.tasks)])
+    if data_config.prompt_from_task:
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
 

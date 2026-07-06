@@ -1,4 +1,10 @@
-"""Dataset loader for XLeRobot datasets in LeRobot format."""
+"""Deprecated dataset loader for XLeRobot datasets in LeRobot format.
+
+This module is deprecated. It was originally added while openpi depended on
+lerobot==0.1.0 to provide a local dataset implementation similar to
+lerobot==0.4.0's LeRobotDataset. openpi now depends on lerobot==0.4.0, so use
+LeRobotDataset from lerobot directly instead.
+"""
 
 from __future__ import annotations
 

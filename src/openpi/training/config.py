@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.flexiv_policy as flexiv_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
@@ -453,6 +454,48 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             outputs=[droid_policy.DroidOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFlexivDataConfig(DataConfigFactory):
+    """Example data config for the custom Flexiv dataset in LeRobot format.
+
+    This config targets the non-tactile Rizon4 conversion output.
+    """
+
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "observation.exterior_image_1_left",
+                        "observation/exterior_image_2_left": "observation.exterior_image_2_left",
+                        "observation/wrist_image_left": "observation.wrist_image_left",
+                        "observation/joint_position": "observation.joint_position",
+                        "observation/gripper_position": "observation.gripper_position",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[flexiv_policy.FlexivInputs(model_type=model_config.model_type)],
+            outputs=[flexiv_policy.FlexivOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -914,6 +957,36 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        # Custom Flexiv LoRA config for the non-tactile Rizon4 dataset.
+        name="pi05_flexiv",
+        model=pi0_config.Pi0Config(action_dim=32, action_horizon=30, pi05=True, paligemma_variant="gemma_2b_lora"),
+        data=LeRobotFlexivDataConfig(
+            repo_id="fduTristin/rizon4_task1",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_config.Pi0Config(
+            action_dim=32, action_horizon=30, pi05=True, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        save_interval=5000,
+        log_interval=500,
+    ),
+    TrainConfig(
+        # Same dataset, but using pi0-FAST.
+        name="pi0_fast_flexiv_finetune",
+        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=10, max_token_len=180),
+        data=LeRobotFlexivDataConfig(
+            repo_id="fduTristin/rizon4_task1",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
         batch_size=32,
     ),
     #

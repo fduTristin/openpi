@@ -1,7 +1,9 @@
 from openpi_client import action_chunk_broker
 import pytest
+import numpy as np
 
 from openpi.policies import aloha_policy
+from openpi.policies import flexiv_policy
 from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
 
@@ -32,3 +34,18 @@ def test_broker():
     for _ in range(config.model.action_horizon):
         outputs = broker.infer(example)
         assert outputs["actions"].shape == (14,)
+
+
+def test_flexiv_inputs():
+    data = flexiv_policy.make_flexiv_example()
+    data["actions"] = np.ones((10, 8))
+    inputs = flexiv_policy.FlexivInputs(model_type=_config.get_config("pi0_flexiv_finetune").model.model_type)(data)
+
+    assert set(inputs["image"]) == {"base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"}
+    assert inputs["state"].shape == (8,)
+    assert inputs["actions"].shape == (10, 8)
+
+
+def test_flexiv_outputs():
+    outputs = flexiv_policy.FlexivOutputs()({"actions": np.ones((10, 12))})
+    assert outputs["actions"].shape == (10, 8)

@@ -91,6 +91,10 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # If set, only load these LeRobot episode indices (e.g. range(12, 91) for episodes 12-90).
+    # None means use all episodes. Only used by the LeRobot/torch data loader.
+    episodes: Sequence[int] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -965,7 +969,8 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(action_dim=32, action_horizon=30, pi05=True, paligemma_variant="gemma_2b_lora"),
         data=LeRobotFlexivDataConfig(
             repo_id="fduTristin/rizon4_task1",
-            base_config=DataConfig(prompt_from_task=True),
+            # Train on episodes 12-90 only (dataset has 91 episodes, indices 0-90).
+            base_config=DataConfig(prompt_from_task=True, episodes=tuple(range(12, 91))),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
@@ -987,7 +992,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
-        batch_size=32,
+        batch_size=64,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

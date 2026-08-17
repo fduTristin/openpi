@@ -968,9 +968,9 @@ _CONFIGS = [
         name="pi05_flexiv",
         model=pi0_config.Pi0Config(action_dim=32, action_horizon=30, pi05=True, paligemma_variant="gemma_2b_lora"),
         data=LeRobotFlexivDataConfig(
-            repo_id="fduTristin/rizon4_task1",
+            repo_id="fduTristin/insert_screw",
             # Train on episodes 12-90 only (dataset has 91 episodes, indices 0-90).
-            base_config=DataConfig(prompt_from_task=True, episodes=tuple(range(12, 91))),
+            base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
